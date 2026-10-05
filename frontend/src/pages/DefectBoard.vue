@@ -538,11 +538,20 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
         @selection-change="handleSelectionChange"
       >
         <el-table-column type="selection" width="46" />
-        <el-table-column label="机组 / 叶片" min-width="150">
+        <el-table-column label="机组 / 叶片" min-width="170">
           <template #default="{ row }">
             <div class="cell-stack">
               <span>{{ row.turbine?.code ?? '—' }}</span>
               <span class="muted">叶片 {{ row.blade?.serial ?? '—' }}｜{{ row.segment ? segmentText(row) : '—' }}</span>
+              <el-tooltip
+                v-if="row.renamedAfterFound"
+                content="该缺陷发现时使用的旧铭牌编号，历史数据按原编号保留"
+                placement="top"
+              >
+                <el-tag size="small" type="warning" effect="plain" class="old-code-tag">
+                  发现时 {{ row.turbineCodeAtFound }} / 叶片 {{ row.bladeCodeAtFound }}
+                </el-tag>
+              </el-tooltip>
             </div>
           </template>
         </el-table-column>
@@ -740,6 +749,11 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
   flex-direction: column;
   gap: 2px;
   font-size: 13px;
+}
+
+.old-code-tag {
+  align-self: flex-start;
+  margin-top: 2px;
 }
 
 .state-pill {

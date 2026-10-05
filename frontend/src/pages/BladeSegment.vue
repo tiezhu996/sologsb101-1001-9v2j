@@ -16,6 +16,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useBladeStore } from '@/stores/bladeStore'
 import { useDefectStore } from '@/stores/defectStore'
 import { useTurbineStore } from '@/stores/turbineStore'
+import { useRenumberStore } from '@/stores/renumberStore'
 import { useDefectFilter } from '@/hooks/useDefectFilter'
 import { percentOf } from '@/utils/severity'
 import {
@@ -43,6 +44,7 @@ const router = useRouter()
 const turbineStore = useTurbineStore()
 const bladeStore = useBladeStore()
 const defectStore = useDefectStore()
+const renumberStore = useRenumberStore()
 
 const MAX_PREVIEW_BYTES = 1.5 * 1024 * 1024
 
@@ -567,7 +569,19 @@ const faceSummary = computed(() =>
     <template v-else>
       <div class="section-card">
         <div class="section-card__head">
-          <h3>叶片 {{ blade.serial }} · {{ turbine?.code }}</h3>
+          <h3>
+            叶片 {{ blade.serial }} · {{ turbine?.code }}
+            <el-tag
+              v-for="alias in renumberStore.bladeAliases(blade.id)"
+              :key="alias"
+              size="small"
+              type="info"
+              effect="plain"
+              class="alias-tag"
+            >
+              旧序号 {{ alias }}
+            </el-tag>
+          </h3>
           <el-radio-group
             :model-value="blade.id"
             size="small"
@@ -917,6 +931,11 @@ const faceSummary = computed(() =>
 </template>
 
 <style scoped>
+.alias-tag {
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
 .face-quick {
   display: flex;
   align-items: center;

@@ -360,6 +360,15 @@ const tableRows = computed(() => workOrderStore.sortedRows)
                 {{ row.defect?.type ?? '缺陷已删除' }}｜{{ row.defect ? faceText(row.defect.face) : '—' }}｜
                 {{ row.defect ? `${row.defect.positionM} m` : '—' }}
               </span>
+              <el-tooltip
+                v-if="row.renamedAfterCreated"
+                content="该工单派发时使用的旧铭牌编号，历史数据按原编号保留"
+                placement="top"
+              >
+                <el-tag size="small" type="warning" effect="plain" class="old-code-tag">
+                  派工时 {{ row.turbineCodeAtCreated }} / 叶片 {{ row.bladeCodeAtCreated }}
+                </el-tag>
+              </el-tooltip>
             </div>
           </template>
         </el-table-column>
@@ -538,6 +547,11 @@ const tableRows = computed(() => workOrderStore.sortedRows)
   flex-direction: column;
   gap: 2px;
   font-size: 13px;
+}
+
+.old-code-tag {
+  align-self: flex-start;
+  margin-top: 2px;
 }
 
 .state-pill {

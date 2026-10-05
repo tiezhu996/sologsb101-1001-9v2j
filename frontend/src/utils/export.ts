@@ -3,12 +3,22 @@ import {
   createId,
   db,
   DB_VERSION,
+  dateFromTs,
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { CodeHistory } from '@/types/codeHistory'
 import { reportFileName, type TurbineReport } from '@/utils/report'
 
-const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
+const COLLECTIONS = [
+  'turbines',
+  'blades',
+  'segments',
+  'defects',
+  'workOrders',
+  'codeHistories',
+  'renumberOrders'
+] as const
 
 type CollectionKey = (typeof COLLECTIONS)[number]
 
@@ -44,12 +54,14 @@ export function validateBackup(input: unknown): {
 
 /** 组装当前本地数据的全量备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [turbines, blades, segments, defects, workOrders] = await Promise.all([
+  const [turbines, blades, segments, defects, workOrders, codeHistories, renumberOrders] = await Promise.all([
     db.turbines.toArray(),
     db.blades.toArray(),
     db.segments.toArray(),
     db.defects.toArray(),
-    db.workOrders.toArray()
+    db.workOrders.toArray(),
+    db.codeHistories.toArray(),
+    db.renumberOrders.toArray()
   ])
   return {
     app: 'gbwindblade',
@@ -59,7 +71,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     blades,
     segments,
     defects,
-    workOrders
+    workOrders,
+    codeHistories,
+    renumberOrders
   }
 }
 
@@ -82,7 +96,9 @@ export function countPayload(payload: BackupPayload): Record<CollectionKey, numb
     blades: payload.blades.length,
     segments: payload.segments.length,
     defects: payload.defects.length,
-    workOrders: payload.workOrders.length
+    workOrders: payload.workOrders.length,
+    codeHistories: payload.codeHistories?.length ?? 0,
+    renumberOrders: payload.renumberOrders?.length ?? 0
   }
 }
 
@@ -117,23 +133,92 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
+/**
+ * 为资产补齐初始编号时间段：旧版本备份（v2 及以前）没有 codeHistories，
+ * 导入后若不补录，「按旧编号兼容读取 / 报告显示当时编号」就没有时间线可用。
+ * 已存在时间段的资产跳过，保持幂等。
+ */
+async function backfillCodeHistories(payload: BackupPayload): Promise<CodeHistory[]> {
+  const existing = await db.codeHistories.toArray()
+  const openByAsset = new Set(
+    existing.filter((row) => row.effectiveTo === null).map((row) => `${row.assetType}:${row.assetId}`)
+  )
+  const now = Date.now()
+  const added: CodeHistory[] = []
+  payload.turbines.forEach((turbine) => {
+    const key = `turbine:${turbine.id}`
+    if (openByAsset.has(key)) return
+    added.push({
+      id: createId('ch'),
+      assetType: 'turbine',
+      assetId: turbine.id,
+      code: turbine.code,
+      effectiveFrom: turbine.commissionDate || dateFromTs(turbine.createdAt ?? now),
+      effectiveTo: null,
+      sourceOrderId: null,
+      createdAt: now
+    })
+  })
+  payload.blades.forEach((blade) => {
+    const key = `blade:${blade.id}`
+    if (openByAsset.has(key)) return
+    added.push({
+      id: createId('ch'),
+      assetType: 'blade',
+      assetId: blade.id,
+      code: blade.serial,
+      effectiveFrom: dateFromTs(blade.createdAt ?? now),
+      effectiveTo: null,
+      sourceOrderId: null,
+      createdAt: now
+    })
+  })
+  if (added.length > 0) await db.codeHistories.bulkAdd(added)
+  return added
+}
+
 /** 导入备份：overwrite=true 先清空全部表，否则按主键合并（同 id 覆盖） */
 export async function importBackup(
   payload: BackupPayload,
   overwrite: boolean
 ): Promise<Record<CollectionKey, number>> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await db.turbines.bulkPut(payload.turbines)
-    await db.blades.bulkPut(payload.blades)
-    await db.segments.bulkPut(payload.segments)
-    await db.defects.bulkPut(payload.defects)
-    await db.workOrders.bulkPut(payload.workOrders)
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.turbines,
+      db.blades,
+      db.segments,
+      db.defects,
+      db.workOrders,
+      db.codeHistories,
+      db.renumberOrders
+    ],
+    async () => {
+      await db.turbines.bulkPut(payload.turbines)
+      await db.blades.bulkPut(payload.blades)
+      await db.segments.bulkPut(payload.segments)
+      await db.defects.bulkPut(payload.defects)
+      await db.workOrders.bulkPut(payload.workOrders)
+      if (payload.codeHistories && payload.codeHistories.length > 0) {
+        await db.codeHistories.bulkPut(payload.codeHistories)
+      }
+      if (payload.renumberOrders && payload.renumberOrders.length > 0) {
+        await db.renumberOrders.bulkPut(payload.renumberOrders)
+      }
+    }
+  )
+  // 旧版备份（无编号时间线）导入后补录初始段，保证历史数据仍可按原编号读取
+  if (!payload.codeHistories || payload.codeHistories.length === 0) {
+    await backfillCodeHistories(payload)
+  }
   return countPayload(payload)
 }
 
-/** 追加式导入：为导入数据重新分配 id 并重建外键关系，避免覆盖现有档案 */
+/**
+ * 追加式导入：为导入数据重新分配 id 并重建外键关系，避免覆盖现有档案。
+ * 编号时间线按新资产 id 一并重映射；变更单快照含旧 id，追加场景不导入（仅资产数据）。
+ */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const turbineIdMap = new Map<string, string>()
   const bladeIdMap = new Map<string, string>()
@@ -165,6 +250,13 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('wo'),
     defectId: defectIdMap.get(order.defectId) ?? order.defectId
   }))
+  const codeHistories = (payload.codeHistories ?? []).map((history) => {
+    const newAssetId =
+      history.assetType === 'turbine'
+        ? turbineIdMap.get(history.assetId)
+        : bladeIdMap.get(history.assetId)
+    return { ...history, id: createId('ch'), assetId: newAssetId ?? history.assetId }
+  })
 
-  return { ...payload, turbines, blades, segments, defects, workOrders }
+  return { ...payload, turbines, blades, segments, defects, workOrders, codeHistories, renumberOrders: [] }
 }

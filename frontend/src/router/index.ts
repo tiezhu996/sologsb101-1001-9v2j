@@ -30,6 +30,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '维修工单', icon: 'Tools' }
   },
   {
+    path: '/renumbers',
+    name: 'asset-change',
+    component: () => import('@/pages/AssetChange.vue'),
+    meta: { title: '资产变更单', icon: 'Switch' }
+  },
+  {
     path: '/report',
     name: 'report-view',
     component: () => import('@/pages/ReportView.vue'),

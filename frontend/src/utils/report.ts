@@ -19,6 +19,8 @@ export interface ReportSegmentLine {
   heavyCount: number
   areaCm2: number
   defects: Defect[]
+  /** 每条缺陷发现当时的叶片编号（按 foundAt 命中编号时间线） */
+  bladeCodeAtFound: Record<string, string>
 }
 
 /** 报告中的单片叶片 */
@@ -29,16 +31,23 @@ export interface ReportBladeSection {
   openCount: number
   heavyCount: number
   areaCm2: number
+  /** 旧编号别名（曾用序号，旧铭牌可对照） */
+  aliases: string[]
 }
 
-/** 报告中的工单行（带缺陷定位信息） */
+/** 报告中的工单行（带缺陷定位信息与工单发生当时的编号） */
 export interface ReportWorkOrderLine {
   order: WorkOrder
   defectType: DefectType
   severity: Severity
+  /** 工单创建当时的叶片编号（旧铭牌序号） */
   bladeSerial: string
   segmentIndex: number
   overdue: boolean
+  /** 工单创建当时的机组编号 */
+  turbineCode: string
+  /** 当时编号是否已被变更单更新（true 表示报告展示的是旧编号） */
+  renamed: boolean
 }
 
 /** 按机组生成的巡检报告数据结构（同时作为导出 JSON 的结构） */
@@ -76,12 +85,32 @@ export interface TurbineReport {
   workOrders: ReportWorkOrderLine[]
 }
 
-/** 报告数据来源：全部模型均由调用方（store）注入，report.ts 保持纯函数 */
+/**
+ * 报告数据来源：全部模型均由调用方（store）注入，report.ts 保持纯函数。
+ * resolveCode 由编号时间线提供：按记录发生日期还原当时编号；缺省时退化为当前编号。
+ */
 export interface ReportSource {
   blades: Blade[]
   segments: Segment[]
   defects: Defect[]
   workOrders: WorkOrder[]
+  resolveCode?: (assetType: 'turbine' | 'blade', assetId: string, date: string, fallback: string) => string
+  aliasesOf?: (assetType: 'turbine' | 'blade', assetId: string) => string[]
+}
+
+/** 编号解析兜底：没有时间线数据时直接用当前编号 */
+function fallbackResolve(
+  source: ReportSource,
+  assetType: 'turbine' | 'blade',
+  assetId: string,
+  date: string,
+  fallback: string
+): string {
+  return source.resolveCode ? source.resolveCode(assetType, assetId, date, fallback) : fallback
+}
+
+function fallbackAliases(source: ReportSource, assetType: 'turbine' | 'blade', assetId: string): string[] {
+  return source.aliasesOf ? source.aliasesOf(assetType, assetId) : []
 }
 
 function distribution(labels: string[], counts: Record<string, number>, total: number): ReportDistributionRow[] {
@@ -111,13 +140,19 @@ export function buildTurbineReport(
         const defects = source.defects
           .filter((defect) => defect.segmentId === segment.id)
           .sort((a, b) => SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity])
+        // 报告按记录发生时间显示当时编号：逐缺陷按 foundAt 解析
+        const bladeCodeAtFound: Record<string, string> = {}
+        defects.forEach((defect) => {
+          bladeCodeAtFound[defect.id] = fallbackResolve(source, 'blade', blade.id, defect.foundAt, blade.serial)
+        })
         return {
           segment,
           defectCount: defects.length,
           openCount: defects.filter((defect) => defect.state !== '已修复').length,
           heavyCount: defects.filter((defect) => defect.severity === '重度').length,
           areaCm2: defects.reduce((sum, defect) => sum + defectAreaCm2(defect.lengthMm, defect.widthMm), 0),
-          defects
+          defects,
+          bladeCodeAtFound
         }
       })
     return {
@@ -126,7 +161,8 @@ export function buildTurbineReport(
       defectCount: segments.reduce((sum, line) => sum + line.defectCount, 0),
       openCount: segments.reduce((sum, line) => sum + line.openCount, 0),
       heavyCount: segments.reduce((sum, line) => sum + line.heavyCount, 0),
-      areaCm2: segments.reduce((sum, line) => sum + line.areaCm2, 0)
+      areaCm2: segments.reduce((sum, line) => sum + line.areaCm2, 0),
+      aliases: fallbackAliases(source, 'blade', blade.id)
     }
   })
 
@@ -150,6 +186,14 @@ export function buildTurbineReport(
   const defectById = new Map(source.defects.map((defect) => [defect.id, defect]))
   const today = generatedAt.slice(0, 10)
 
+  /** 工单时间点取创建日期：报告按记录发生时间显示当时编号 */
+  const dateOfTs = (ts: number): string => {
+    const date = new Date(ts)
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
+      date.getDate()
+    ).padStart(2, '0')}`
+  }
+
   const workOrders: ReportWorkOrderLine[] = source.workOrders
     .filter((order) => defectById.has(order.defectId))
     .filter((order) => {
@@ -163,13 +207,18 @@ export function buildTurbineReport(
       const defect = defectById.get(order.defectId) as Defect
       const segment = defectToSegment.get(defect.segmentId) as Segment
       const blade = bladeById.get(segment.bladeId) as Blade
+      const orderDate = dateOfTs(order.createdAt)
+      const bladeCode = fallbackResolve(source, 'blade', blade.id, orderDate, blade.serial)
+      const turbineCode = fallbackResolve(source, 'turbine', blade.turbineId, orderDate, turbine.code)
       return {
         order,
         defectType: defect.type,
         severity: defect.severity,
-        bladeSerial: blade.serial,
+        bladeSerial: bladeCode,
         segmentIndex: segment.index,
-        overdue: isOverdue(order, today)
+        overdue: isOverdue(order, today),
+        turbineCode,
+        renamed: bladeCode !== blade.serial || turbineCode !== turbine.code
       }
     })
 
@@ -249,30 +298,34 @@ export function reportToText(report: TurbineReport): string {
   lines.push('')
   lines.push('五、叶片与展向分段明细')
   report.blades.forEach((section) => {
+    const aliasText = section.aliases.length > 0 ? `｜旧编号 ${section.aliases.join('、')}` : ''
     lines.push(
-      `  [叶片 ${section.blade.serial}] 长度 ${section.blade.lengthM} m｜材质 ${section.blade.material}｜分段 ${section.segments.length} 段｜缺陷 ${section.defectCount} 条｜未闭环 ${section.openCount} 条`
+      `  [叶片 ${section.blade.serial}]${aliasText} 长度 ${section.blade.lengthM} m｜材质 ${section.blade.material}｜分段 ${section.segments.length} 段｜缺陷 ${section.defectCount} 条｜未闭环 ${section.openCount} 条`
     )
     section.segments.forEach((line) => {
       lines.push(
         `    第 ${line.segment.index} 段 ${line.segment.startM}-${line.segment.endM} m｜${line.segment.face}｜翼型 ${line.segment.airfoil}｜剖面图 ${line.segment.sectionImage || '未上传'}｜缺陷 ${line.defectCount} 条`
       )
       line.defects.forEach((defect) => {
+        // 按缺陷发生（发现）日期显示当时编号；与当前序号不同时追加现编号对照
+        const codeAtFound = line.bladeCodeAtFound[defect.id] ?? section.blade.serial
+        const renamed = codeAtFound !== section.blade.serial ? `（当时叶片 ${codeAtFound}，现编号 ${section.blade.serial}）` : ''
         lines.push(
-          `      · ${defect.type}（${defect.severity}）${defect.lengthMm}×${defect.widthMm} mm｜${defect.face}｜${defect.positionM} m｜发现 ${defect.foundAt}｜${defect.state}`
+          `      · ${defect.type}（${defect.severity}）${defect.lengthMm}×${defect.widthMm} mm｜${defect.face}｜${defect.positionM} m｜发现 ${defect.foundAt}｜${defect.state}${renamed}`
         )
       })
     })
   })
   lines.push('')
-  lines.push('六、维修工单')
+  lines.push('六、维修工单（编号按工单发生时间显示）')
   if (report.workOrders.length === 0) {
     lines.push('  （暂无工单）')
   }
   report.workOrders.forEach((line) => {
     lines.push(
-      `  #${line.order.id.slice(-6)} 叶片 ${line.bladeSerial} 第 ${line.segmentIndex} 段｜${line.defectType}（${line.severity}）｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}${
+      `  #${line.order.id.slice(-6)} ${line.turbineCode} / 叶片 ${line.bladeSerial} 第 ${line.segmentIndex} 段｜${line.defectType}（${line.severity}）｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}${
         line.overdue ? '（已超期）' : ''
-      }｜验收人 ${line.order.acceptor || '—'}`
+      }${line.renamed ? '（旧编号）' : ''}｜验收人 ${line.order.acceptor || '—'}`
     )
   })
   return lines.join('\n')

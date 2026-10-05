@@ -15,6 +15,8 @@ import type { Segment } from '@/types/segment'
 import type { Blade } from '@/types/blade'
 import type { Turbine } from '@/types/turbine'
 import { percentOf } from '@/utils/severity'
+import { dateFromTs } from '@/utils/db'
+import { useRenumberStore } from '@/stores/renumberStore'
 
 /** 工单列表的一行：工单 + 缺陷 + 分段 + 叶片 + 机组 */
 export interface WorkOrderRow {
@@ -25,6 +27,10 @@ export interface WorkOrderRow {
   turbine: Turbine | null
   /** 限期已过且未闭环 */
   overdue: boolean
+  /** 工单发生（创建）当时的机组 / 叶片编号 */
+  turbineCodeAtCreated: string
+  bladeCodeAtCreated: string
+  renamedAfterCreated: boolean
 }
 
 /** 可派工缺陷候选项（不含工单字段，供派工下拉框使用） */
@@ -59,6 +65,7 @@ export const useWorkOrderStore = defineStore('workOrder', () => {
   const segmentsTable = useIdbTable<Segment>((database) => database.segments, { sortByUpdatedAt: false })
   const bladesTable = useIdbTable<Blade>((database) => database.blades, { sortByUpdatedAt: false })
   const turbinesTable = useIdbTable<Turbine>((database) => database.turbines, { sortByUpdatedAt: false })
+  const renumberStore = useRenumberStore()
 
   const keyword = ref('')
   const teamFilter = ref<string[]>([])
@@ -85,7 +92,28 @@ export const useWorkOrderStore = defineStore('workOrder', () => {
       const segment = defect ? segmentMap.get(defect.segmentId) ?? null : null
       const blade = segment ? bladeMap.get(segment.bladeId) ?? null : null
       const turbine = blade ? turbineMap.get(blade.turbineId) ?? null : null
-      return { order, defect, segment, blade, turbine, overdue: isOverdue(order, today.value) }
+      // 工单编号时间点取创建时间（YYYY-MM-DD）
+      const orderDate = dateFromTs(order.createdAt)
+      const turbineCodeAtCreated = turbine
+        ? renumberStore.turbineCodeAt(turbine.id, orderDate, turbine.code)
+        : ''
+      const bladeCodeAtCreated = blade
+        ? renumberStore.bladeCodeAt(blade.id, orderDate, blade.serial)
+        : ''
+      const renamedAfterCreated =
+        (turbine !== null && turbineCodeAtCreated !== turbine.code) ||
+        (blade !== null && bladeCodeAtCreated !== blade.serial)
+      return {
+        order,
+        defect,
+        segment,
+        blade,
+        turbine,
+        overdue: isOverdue(order, today.value),
+        turbineCodeAtCreated,
+        bladeCodeAtCreated,
+        renamedAfterCreated
+      }
     })
   })
 
@@ -95,9 +123,14 @@ export const useWorkOrderStore = defineStore('workOrder', () => {
       const { order, defect, blade, turbine } = row
       const kw = keyword.value.trim()
       if (kw.length > 0) {
+        // 旧铭牌编号兼容检索：创建当时编号与全部别名都参与匹配
+        const turbineAliases = turbine ? renumberStore.turbineAliases(turbine.id).join('') : ''
+        const bladeAliases = blade ? renumberStore.bladeAliases(blade.id).join('') : ''
         const haystack = `${order.team}${order.state}${order.acceptor}${order.dueDate}${
           defect?.type ?? ''
-        }${defect?.severity ?? ''}${blade?.serial ?? ''}${turbine?.code ?? ''}`
+        }${defect?.severity ?? ''}${blade?.serial ?? ''}${turbine?.code ?? ''}${
+          row.turbineCodeAtCreated
+        }${row.bladeCodeAtCreated}${turbineAliases}${bladeAliases}`
         if (!haystack.includes(kw)) return false
       }
       if (teamFilter.value.length > 0 && !teamFilter.value.includes(order.team)) return false

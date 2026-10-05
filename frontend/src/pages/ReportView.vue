@@ -28,8 +28,10 @@ import { formatArea, formatSize } from '@/utils/severity'
 import { FACE_LABEL, formatRange, type SegmentFace } from '@/types/segment'
 import { DEFECT_STATE_COLOR, type DefectState } from '@/types/defect'
 import type { BackupPayload } from '@/utils/db'
+import { useRenumberStore } from '@/stores/renumberStore'
 
 const turbineStore = useTurbineStore()
+const renumberStore = useRenumberStore()
 
 const selectedTurbineId = ref<string>(turbineStore.currentTurbineId ?? '')
 
@@ -69,7 +71,11 @@ const report = computed<TurbineReport | null>(() => {
       blades: turbineStore.blades,
       segments: turbineStore.segments,
       defects: turbineStore.defects,
-      workOrders: turbineStore.workOrders
+      workOrders: turbineStore.workOrders,
+      // 报告按记录发生时间显示当时编号：缺陷按 foundAt、工单按创建日期命中编号时间线
+      resolveCode: (assetType, assetId, date, fallback) =>
+        renumberStore.codeIndex.at(assetType, assetId, date, fallback),
+      aliasesOf: (assetType, assetId) => renumberStore.codeIndex.aliases(assetType, assetId)
     },
     DB_VERSION
   )
@@ -287,6 +293,9 @@ watch(bladePanels, (panels) => {
           <el-descriptions-item label="缺陷 / 工单">
             {{ dbMeta.defects }} 条 / {{ dbMeta.workOrders }} 张
           </el-descriptions-item>
+          <el-descriptions-item label="编号时间线 / 变更单">
+            {{ renumberStore.histories.length }} 段 / {{ renumberStore.orders.length }} 张
+          </el-descriptions-item>
         </el-descriptions>
       </div>
 
@@ -378,6 +387,16 @@ watch(bladePanels, (panels) => {
               <template #title>
                 <div class="panel-title">
                   <strong>叶片 {{ panel.blade.serial }}</strong>
+                  <el-tag
+                    v-for="alias in panel.aliases"
+                    :key="alias"
+                    size="small"
+                    type="info"
+                    effect="plain"
+                    class="alias-tag"
+                  >
+                    旧编号 {{ alias }}
+                  </el-tag>
                   <span class="muted">
                     {{ panel.blade.lengthM }} m · {{ panel.blade.material }} · {{ panel.segments.length }} 段
                   </span>
@@ -432,6 +451,13 @@ watch(bladePanels, (panels) => {
                         <template #default="{ row: defect }">{{ defect.positionM }} m</template>
                       </el-table-column>
                       <el-table-column label="发现日期" prop="foundAt" width="120" />
+                      <el-table-column label="当时叶片编号" width="130">
+                        <template #default="{ row: defect }">
+                          <span :class="{ 'old-code': row.bladeCodeAtFound[defect.id] !== panel.blade.serial }">
+                            {{ row.bladeCodeAtFound[defect.id] ?? panel.blade.serial }}
+                          </span>
+                        </template>
+                      </el-table-column>
                       <el-table-column label="状态" width="100">
                         <template #default="{ row: defect }">
                           <span :style="{ color: stateColor(defect.state), fontWeight: 600 }">
@@ -464,9 +490,10 @@ watch(bladePanels, (panels) => {
                 <span class="mono">#{{ row.order.id.slice(-6) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="定位" min-width="180">
+            <el-table-column label="定位（派工时编号）" min-width="220">
               <template #default="{ row }">
-                叶片 {{ row.bladeSerial }}｜第 {{ row.segmentIndex }} 段
+                {{ row.turbineCode }}｜叶片 {{ row.bladeSerial }}｜第 {{ row.segmentIndex }} 段
+                <el-tag v-if="row.renamed" size="small" type="warning" effect="plain" class="alias-tag">旧编号</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="缺陷" min-width="150">
@@ -524,6 +551,8 @@ watch(bladePanels, (panels) => {
           <el-descriptions-item label="分段">{{ importCounts.segments }}</el-descriptions-item>
           <el-descriptions-item label="缺陷">{{ importCounts.defects }}</el-descriptions-item>
           <el-descriptions-item label="工单">{{ importCounts.workOrders }}</el-descriptions-item>
+          <el-descriptions-item label="编号时间线">{{ importCounts.codeHistories }}</el-descriptions-item>
+          <el-descriptions-item label="资产变更单">{{ importCounts.renumberOrders }}</el-descriptions-item>
           <el-descriptions-item label="文件版本">v{{ importPayload.dbVersion }}</el-descriptions-item>
         </el-descriptions>
         <el-radio-group v-model="importMode" class="import-mode">
@@ -599,6 +628,15 @@ watch(bladePanels, (panels) => {
   align-items: center;
   gap: 10px;
   font-size: 13px;
+}
+
+.alias-tag {
+  margin-left: 2px;
+}
+
+.old-code {
+  color: #b88230;
+  font-weight: 600;
 }
 
 .defect-subtable {

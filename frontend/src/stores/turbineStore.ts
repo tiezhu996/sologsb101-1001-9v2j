@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, dateFromTs, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   DEFAULT_BLADE_COUNT,
@@ -19,6 +19,35 @@ import type { Segment } from '@/types/segment'
 import type { Defect } from '@/types/defect'
 import type { WorkOrder } from '@/types/workOrder'
 import { percentOf } from '@/utils/severity'
+
+/** 新增一条「当前」编号时间段（机组 / 叶片建档时调用） */
+async function addInitialCodeHistory(params: {
+  assetType: 'turbine' | 'blade'
+  assetId: string
+  code: string
+  effectiveFrom: string
+}): Promise<void> {
+  await db.codeHistories.add({
+    id: `ch-${params.assetType}-${params.assetId}-${Date.now().toString(36)}`,
+    assetType: params.assetType,
+    assetId: params.assetId,
+    code: params.code,
+    effectiveFrom: params.effectiveFrom,
+    effectiveTo: null,
+    sourceOrderId: null,
+    createdAt: Date.now()
+  })
+}
+
+/** 删除资产时一并清理编号时间线（级联删除的一部分） */
+async function deleteCodeHistory(assetType: 'turbine' | 'blade', assetId: string): Promise<void> {
+  const rows = await db.codeHistories
+    .where('assetId')
+    .equals(assetId)
+    .filter((row) => row.assetType === assetType)
+    .primaryKeys()
+  await db.codeHistories.bulkDelete(rows)
+}
 
 /** 新建机组的入参：除机组本体外，同时给出派生叶片所需的默认参数 */
 export interface CreateTurbineInput {
@@ -179,7 +208,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     return blades.value.find((blade) => blade.id === id)
   }
 
-  /** 新建机组：按 bladeCount 派生对应数量的叶片记录 */
+  /** 新建机组：按 bladeCount 派生对应数量的叶片记录，并写入初始编号时间线 */
   async function createTurbine(input: CreateTurbineInput): Promise<Turbine> {
     const turbine = await turbinesTable.create(
       {
@@ -192,21 +221,57 @@ export const useTurbineStore = defineStore('turbine', () => {
       'tbn'
     )
     const count = Math.max(1, Math.floor(input.bladeCount))
-    const newBlades: Blade[] = []
     const now = Date.now()
+    const newBlades: Blade[] = []
+    const codeHistories: Array<{
+      id: string
+      assetType: 'turbine' | 'blade'
+      assetId: string
+      code: string
+      effectiveFrom: string
+      effectiveTo: null
+      sourceOrderId: null
+      createdAt: number
+    }> = [
+      {
+        id: `ch-turbine-${turbine.id}-${now.toString(36)}`,
+        assetType: 'turbine',
+        assetId: turbine.id,
+        code: turbine.code,
+        effectiveFrom: turbine.commissionDate || dateFromTs(now),
+        effectiveTo: null,
+        sourceOrderId: null,
+        createdAt: now
+      }
+    ]
     for (let i = 0; i < count; i += 1) {
+      const serial = serialFromIndex(i)
+      const bladeId = `${turbine.id}-bld-${i + 1}`
       newBlades.push({
-        id: `${turbine.id}-bld-${i + 1}`,
+        id: bladeId,
         turbineId: turbine.id,
-        serial: serialFromIndex(i),
+        serial,
         lengthM: input.bladeLengthM || DEFAULT_BLADE_LENGTH_M,
         material: input.bladeMaterial,
         segmentCount: DEFAULT_SEGMENT_COUNT,
         createdAt: now,
         updatedAt: now
       })
+      codeHistories.push({
+        id: `ch-blade-${bladeId}-${now.toString(36)}`,
+        assetType: 'blade',
+        assetId: bladeId,
+        code: serial,
+        effectiveFrom: turbine.commissionDate || dateFromTs(now),
+        effectiveTo: null,
+        sourceOrderId: null,
+        createdAt: now
+      })
     }
-    await bladesTable.bulkPut(newBlades)
+    await db.transaction('rw', [db.blades, db.codeHistories], async () => {
+      await db.blades.bulkPut(newBlades)
+      await db.codeHistories.bulkAdd(codeHistories)
+    })
     currentTurbineId.value = turbine.id
     return turbine
   }
@@ -229,17 +294,22 @@ export const useTurbineStore = defineStore('turbine', () => {
     if (target > current.length) {
       const now = Date.now()
       const added: Blade[] = []
+      const turbine = turbineById(turbineId)
+      const effectiveFrom = turbine?.commissionDate || dateFromTs(now)
       for (let i = current.length; i < target; i += 1) {
+        const serial = serialFromIndex(i)
+        const bladeId = `${turbineId}-bld-${i + 1}`
         added.push({
-          id: `${turbineId}-bld-${i + 1}`,
+          id: bladeId,
           turbineId,
-          serial: serialFromIndex(i),
+          serial,
           lengthM: defaults?.lengthM ?? current[0]?.lengthM ?? DEFAULT_BLADE_LENGTH_M,
           material: defaults?.material ?? current[0]?.material ?? '玻璃纤维',
           segmentCount: current[0]?.segmentCount ?? DEFAULT_SEGMENT_COUNT,
           createdAt: now,
           updatedAt: now
         })
+        await addInitialCodeHistory({ assetType: 'blade', assetId: bladeId, code: serial, effectiveFrom })
       }
       await bladesTable.bulkPut(added)
       await turbinesTable.update(turbineId, { bladeCount: target })
@@ -270,6 +340,13 @@ export const useTurbineStore = defineStore('turbine', () => {
       },
       'bld'
     )
+    const turbine = turbineById(input.turbineId)
+    await addInitialCodeHistory({
+      assetType: 'blade',
+      assetId: blade.id,
+      code: blade.serial,
+      effectiveFrom: turbine?.commissionDate || dateFromTs(Date.now())
+    })
     const list = bladesOfTurbine(input.turbineId)
     await turbinesTable.update(input.turbineId, { bladeCount: list.length })
     return blade
@@ -288,12 +365,13 @@ export const useTurbineStore = defineStore('turbine', () => {
       .map((defect) => defect.id)
     await db.transaction(
       'rw',
-      [db.blades, db.segments, db.defects, db.workOrders],
+      [db.blades, db.segments, db.defects, db.workOrders, db.codeHistories],
       async () => {
         await db.workOrders.where('defectId').anyOf(defectIds).delete()
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.delete(id)
+        await deleteCodeHistory('blade', id)
       }
     )
     if (blade) {
@@ -313,13 +391,15 @@ export const useTurbineStore = defineStore('turbine', () => {
       .map((defect) => defect.id)
     await db.transaction(
       'rw',
-      [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
+      [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.codeHistories],
       async () => {
         await db.workOrders.where('defectId').anyOf(defectIds).delete()
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.bulkDelete(bladeIds)
         await db.turbines.delete(id)
+        await deleteCodeHistory('turbine', id)
+        await Promise.all(bladeIds.map((bladeId) => deleteCodeHistory('blade', bladeId)))
       }
     )
     if (currentTurbineId.value === id) currentTurbineId.value = null

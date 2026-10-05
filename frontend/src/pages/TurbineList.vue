@@ -10,6 +10,7 @@ import { useTurbineStore } from '@/stores/turbineStore'
 import { useBladeStore } from '@/stores/bladeStore'
 import { useDefectStore } from '@/stores/defectStore'
 import { useWorkOrderStore } from '@/stores/workOrderStore'
+import { useRenumberStore } from '@/stores/renumberStore'
 import { seedDemoData } from '@/utils/db'
 import { formatArea } from '@/utils/severity'
 import {
@@ -31,6 +32,7 @@ const turbineStore = useTurbineStore()
 const bladeStore = useBladeStore()
 const defectStore = useDefectStore()
 const workOrderStore = useWorkOrderStore()
+const renumberStore = useRenumberStore()
 
 function todayString(): string {
   const date = new Date()
@@ -156,8 +158,8 @@ async function submitForm(): Promise<void> {
       )
     } else if (editingId.value) {
       const id = editingId.value
+      // 编号不在此直接修改：增容改号统一走「资产变更单」，旧编号会作为别名保留
       await turbineStore.updateTurbine(id, {
-        code: form.code.trim(),
         model: form.model,
         hubHeightM: form.hubHeightM,
         commissionDate: form.commissionDate
@@ -245,6 +247,7 @@ const summary = computed(() => turbineStore.totals)
       </div>
       <div class="toolbar">
         <el-button :icon="Refresh" @click="turbineStore.resetFilters()">清空筛选</el-button>
+        <el-button @click="router.push('/renumbers')">资产变更单</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新建机组</el-button>
       </div>
     </div>
@@ -289,6 +292,16 @@ const summary = computed(() => turbineStore.totals)
           <div class="turbine-card__head">
             <div class="turbine-card__title">
               <strong>{{ card.turbine.code }}</strong>
+              <el-tag
+                v-for="alias in renumberStore.turbineAliases(card.turbine.id)"
+                :key="alias"
+                size="small"
+                type="info"
+                effect="plain"
+                class="alias-tag"
+              >
+                旧名 {{ alias }}
+              </el-tag>
               <el-tag size="small" effect="plain" type="info">{{ card.turbine.model }}</el-tag>
             </div>
             <el-tag v-if="card.openCount > 0" size="small" type="warning" effect="dark">
@@ -354,7 +367,16 @@ const summary = computed(() => turbineStore.totals)
     >
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-form-item label="机组编号" prop="code">
-          <el-input v-model="form.code" placeholder="如 WT-A01" clearable />
+          <el-input
+            v-model="form.code"
+            placeholder="如 WT-A01"
+            clearable
+            :readonly="dialogMode === 'edit'"
+            :disabled="dialogMode === 'edit'"
+          />
+          <div v-if="dialogMode === 'edit'" class="form-hint">
+            编号锁定：增容改号请到「资产变更单」提交，旧编号会作为别名保留，历史数据按原编号兼容读取。
+          </div>
         </el-form-item>
         <el-form-item label="机型" prop="model">
           <el-select
@@ -437,6 +459,17 @@ const summary = computed(() => turbineStore.totals)
   align-items: center;
   gap: 8px;
   font-size: 16px;
+}
+
+.alias-tag {
+  font-style: normal;
+}
+
+.form-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #909399;
 }
 
 .turbine-card__progress {

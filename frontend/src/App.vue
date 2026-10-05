@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Document, Grid, Odometer, Tools, WarningFilled } from '@element-plus/icons-vue'
+import { Document, Grid, Odometer, Switch, Tools, WarningFilled } from '@element-plus/icons-vue'
 import { useTurbineStore } from '@/stores/turbineStore'
 import { useBladeStore } from '@/stores/bladeStore'
 import { useDefectStore } from '@/stores/defectStore'
 import { useWorkOrderStore } from '@/stores/workOrderStore'
+import { useRenumberStore } from '@/stores/renumberStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -14,6 +15,7 @@ const turbineStore = useTurbineStore()
 const bladeStore = useBladeStore()
 const defectStore = useDefectStore()
 const workOrderStore = useWorkOrderStore()
+const renumberStore = useRenumberStore()
 
 /** 叶片分段页的跳转目标：上次查看的叶片 → 当前机组的首片叶片 → 全库首片叶片 */
 const targetBladeId = computed<string | null>(() => {
@@ -57,6 +59,13 @@ const navItems = computed(() => {
       label: '维修工单',
       icon: Tools,
       badge: String(workOrderStore.stats.total),
+      disabled: false
+    },
+    {
+      path: '/renumbers',
+      label: '资产变更单',
+      icon: Switch,
+      badge: renumberStore.draftOrders.length > 0 ? String(renumberStore.draftOrders.length) : '',
       disabled: false
     },
     {

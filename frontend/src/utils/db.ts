@@ -4,12 +4,14 @@ import type { Blade, BladeMaterial, BladeSerial } from '@/types/blade'
 import type { Segment, SegmentFace } from '@/types/segment'
 import type { Defect, DefectState, DefectType, Severity } from '@/types/defect'
 import type { WorkOrder, WorkOrderState } from '@/types/workOrder'
+import type { CodeHistory } from '@/types/codeHistory'
+import type { RenumberOrder } from '@/types/renumber'
 
 /** 本地 IndexedDB 库名 */
 export const DB_NAME = 'gbwindblade'
 
 /** 本地结构版本号：新增 / 修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧的少量元数据键 */
 export const LS_KEYS = {
@@ -38,6 +40,9 @@ export interface BackupPayload {
   segments: Segment[]
   defects: Defect[]
   workOrders: WorkOrder[]
+  /** v3 新增：编号时间线与资产变更单；旧版备份导入时按缺省空数组兼容 */
+  codeHistories?: CodeHistory[]
+  renumberOrders?: RenumberOrder[]
 }
 
 /** 全部业务表集合，清空与导入共用 */
@@ -46,7 +51,9 @@ export const ALL_TABLES = [
   'blades',
   'segments',
   'defects',
-  'workOrders'
+  'workOrders',
+  'codeHistories',
+  'renumberOrders'
 ] as const
 
 export class WindBladeDatabase extends Dexie {
@@ -55,6 +62,8 @@ export class WindBladeDatabase extends Dexie {
   segments!: Table<Segment, string>
   defects!: Table<Defect, string>
   workOrders!: Table<WorkOrder, string>
+  codeHistories!: Table<CodeHistory, string>
+  renumberOrders!: Table<RenumberOrder, string>
 
   constructor() {
     super(DB_NAME)
@@ -101,6 +110,47 @@ export class WindBladeDatabase extends Dexie {
             if (!segment.face) segment.face = 'PS'
           })
       })
+    // v3：资产变更单——新增编号时间线与变更单两张表；迁移时为既有机组 / 叶片补录初始时间段
+    this.version(DB_VERSION)
+      .stores({
+        turbines: 'id, code, model, commissionDate, updatedAt',
+        blades: 'id, turbineId, serial, material, updatedAt',
+        segments: 'id, bladeId, index, face, updatedAt',
+        defects: 'id, segmentId, type, severity, face, state, foundAt, updatedAt',
+        workOrders: 'id, defectId, team, state, dueDate, updatedAt',
+        codeHistories: 'id, assetType, assetId, code, effectiveFrom, effectiveTo',
+        renumberOrders: 'id, code, status, effectiveDate, createdAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const historyRows: CodeHistory[] = []
+        await tx.table<Turbine>('turbines').each((turbine) => {
+          historyRows.push({
+            id: `ch-init-${turbine.id}`,
+            assetType: 'turbine',
+            assetId: turbine.id,
+            code: turbine.code,
+            effectiveFrom: turbine.commissionDate || dateFromTs(turbine.createdAt),
+            effectiveTo: null,
+            sourceOrderId: null,
+            createdAt: turbine.createdAt
+          })
+        })
+        await tx.table<Blade>('blades').each((blade) => {
+          historyRows.push({
+            id: `ch-init-${blade.id}`,
+            assetType: 'blade',
+            assetId: blade.id,
+            code: blade.serial,
+            effectiveFrom: dateFromTs(blade.createdAt),
+            effectiveTo: null,
+            sourceOrderId: null,
+            createdAt: blade.createdAt
+          })
+        })
+        if (historyRows.length > 0) {
+          await tx.table<CodeHistory>('codeHistories').bulkAdd(historyRows)
+        }
+      })
   }
 }
 
@@ -114,15 +164,29 @@ export function createId(prefix: string): string {
 
 /** 清空全部业务表，供「清空本地数据」与导入前覆盖使用 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await Promise.all([
-      db.turbines.clear(),
-      db.blades.clear(),
-      db.segments.clear(),
-      db.defects.clear(),
-      db.workOrders.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.turbines,
+      db.blades,
+      db.segments,
+      db.defects,
+      db.workOrders,
+      db.codeHistories,
+      db.renumberOrders
+    ],
+    async () => {
+      await Promise.all([
+        db.turbines.clear(),
+        db.blades.clear(),
+        db.segments.clear(),
+        db.defects.clear(),
+        db.workOrders.clear(),
+        db.codeHistories.clear(),
+        db.renumberOrders.clear()
+      ])
+    }
+  )
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -168,6 +232,14 @@ export function readLastBackupAt(): string | null {
 function dateOffset(days: number): string {
   const date = new Date()
   date.setDate(date.getDate() + days)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
+    date.getDate()
+  ).padStart(2, '0')}`
+}
+
+/** 毫秒时间戳转 YYYY-MM-DD（本地时区），编号时间线迁移使用 */
+export function dateFromTs(ts: number): string {
+  const date = new Date(ts)
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
     date.getDate()
   ).padStart(2, '0')}`
@@ -258,6 +330,7 @@ export async function seedDemoData(): Promise<boolean> {
   const segments: Segment[] = []
   const defects: Defect[] = []
   const workOrders: WorkOrder[] = []
+  const codeHistories: CodeHistory[] = []
 
   const blueprints: Array<{
     code: string
@@ -306,6 +379,16 @@ export async function seedDemoData(): Promise<boolean> {
       createdAt: now,
       updatedAt: now
     })
+    codeHistories.push({
+      id: `ch-init-${turbineId}`,
+      assetType: 'turbine',
+      assetId: turbineId,
+      code: blueprint.code,
+      effectiveFrom: blueprint.commissionDate,
+      effectiveTo: null,
+      sourceOrderId: null,
+      createdAt: now
+    })
 
     blueprint.serials.forEach((serial, bladeIndex) => {
       const bladeId = createId('bld')
@@ -319,6 +402,16 @@ export async function seedDemoData(): Promise<boolean> {
         segmentCount,
         createdAt: now,
         updatedAt: now
+      })
+      codeHistories.push({
+        id: `ch-init-${bladeId}`,
+        assetType: 'blade',
+        assetId: bladeId,
+        code: serial,
+        effectiveFrom: blueprint.commissionDate,
+        effectiveTo: null,
+        sourceOrderId: null,
+        createdAt: now
       })
 
       for (let i = 1; i <= segmentCount; i += 1) {
@@ -396,13 +489,14 @@ export async function seedDemoData(): Promise<boolean> {
 
   await db.transaction(
     'rw',
-    [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.codeHistories],
     async () => {
       await db.turbines.bulkPut(turbines)
       await db.blades.bulkPut(blades)
       await db.segments.bulkPut(segments)
       await db.defects.bulkPut(defects)
       await db.workOrders.bulkPut(workOrders)
+      await db.codeHistories.bulkAdd(codeHistories)
     }
   )
 

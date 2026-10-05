@@ -15,6 +15,7 @@ import type { Blade } from '@/types/blade'
 import type { Turbine } from '@/types/turbine'
 import type { WorkOrder } from '@/types/workOrder'
 import { compareSeverity, defectAreaCm2, percentOf } from '@/utils/severity'
+import { useRenumberStore } from '@/stores/renumberStore'
 
 /** 缺陷标注台的一行：缺陷 + 所属分段 + 叶片 + 机组 */
 export interface DefectRow {
@@ -22,6 +23,11 @@ export interface DefectRow {
   segment: Segment | null
   blade: Blade | null
   turbine: Turbine | null
+  /** 缺陷发现当时的机组 / 叶片编号（按 foundAt 命中编号时间线） */
+  turbineCodeAtFound: string
+  bladeCodeAtFound: string
+  /** 当时编号是否与当前不同（true 时界面提示旧铭牌编号） */
+  renamedAfterFound: boolean
 }
 
 /**
@@ -36,6 +42,7 @@ export const useDefectStore = defineStore('defect', () => {
   const workOrdersTable = useIdbTable<WorkOrder>((database) => database.workOrders, {
     sortByUpdatedAt: false
   })
+  const renumberStore = useRenumberStore()
 
   const filter = ref<DefectFilterState>(createEmptyDefectFilter())
   const selectedIds = reactive<Set<string>>(new Set<string>())
@@ -48,7 +55,7 @@ export const useDefectStore = defineStore('defect', () => {
   const loading = computed(() => defectsTable.loading.value)
   const defectsReady = computed(() => defectsTable.ready.value)
 
-  /** 展开后的缺陷行：附带分段、叶片与机组归属 */
+  /** 展开后的缺陷行：附带分段、叶片与机组归属，并按发现日期解析当时编号 */
   const rows = computed<DefectRow[]>(() => {
     const segmentMap = new Map(segments.value.map((segment) => [segment.id, segment]))
     const bladeMap = new Map(blades.value.map((blade) => [blade.id, blade]))
@@ -57,7 +64,16 @@ export const useDefectStore = defineStore('defect', () => {
       const segment = segmentMap.get(defect.segmentId) ?? null
       const blade = segment ? bladeMap.get(segment.bladeId) ?? null : null
       const turbine = blade ? turbineMap.get(blade.turbineId) ?? null : null
-      return { defect, segment, blade, turbine }
+      const turbineCodeAtFound = turbine
+        ? renumberStore.turbineCodeAt(turbine.id, defect.foundAt, turbine.code)
+        : ''
+      const bladeCodeAtFound = blade
+        ? renumberStore.bladeCodeAt(blade.id, defect.foundAt, blade.serial)
+        : ''
+      const renamedAfterFound =
+        (turbine !== null && turbineCodeAtFound !== turbine.code) ||
+        (blade !== null && bladeCodeAtFound !== blade.serial)
+      return { defect, segment, blade, turbine, turbineCodeAtFound, bladeCodeAtFound, renamedAfterFound }
     })
   })
 
@@ -67,11 +83,14 @@ export const useDefectStore = defineStore('defect', () => {
       const { defect, segment, blade, turbine } = row
       const kw = filter.value.keyword.trim()
       if (kw.length > 0) {
+        // 历史数据按原编号兼容检索：当前编号、发现当时编号、全部旧别名都参与匹配
+        const turbineAliases = turbine ? renumberStore.turbineAliases(turbine.id).join('') : ''
+        const bladeAliases = blade ? renumberStore.bladeAliases(blade.id).join('') : ''
         const haystack = `${defect.type}${defect.severity}${defect.face}${defect.state}${
           defect.foundAt
         }${segment?.airfoil ?? ''}${segment?.sectionImage ?? ''}${blade?.serial ?? ''}${
           turbine?.code ?? ''
-        }`
+        }${row.turbineCodeAtFound}${row.bladeCodeAtFound}${turbineAliases}${bladeAliases}`
         if (!haystack.includes(kw)) return false
       }
       if (filter.value.turbines.length > 0 && (!turbine || !filter.value.turbines.includes(turbine.id)))
