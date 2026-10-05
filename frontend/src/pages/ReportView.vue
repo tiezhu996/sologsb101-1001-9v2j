@@ -52,7 +52,7 @@ watch(selectedTurbineId, (value) => {
   if (value) turbineStore.setCurrentTurbine(value)
 })
 
-/** 按机组实时汇总缺陷统计并生成报告数据结构 */
+/** 按机组实时汇总缺陷统计并生成报告数据结构（编号按记录发生时间解析当时编号） */
 const report = computed<TurbineReport | null>(() => {
   const turbine = turbineStore.turbineById(selectedTurbineId.value)
   if (!turbine) return null
@@ -63,13 +63,15 @@ const report = computed<TurbineReport | null>(() => {
       model: turbine.model,
       hubHeightM: turbine.hubHeightM,
       commissionDate: turbine.commissionDate,
-      bladeCount: turbine.bladeCount
+      bladeCount: turbine.bladeCount,
+      previousCodes: turbineStore.previousCodesOfTurbine(turbine.id)
     },
     {
       blades: turbineStore.blades,
       segments: turbineStore.segments,
       defects: turbineStore.defects,
-      workOrders: turbineStore.workOrders
+      workOrders: turbineStore.workOrders,
+      aliases: turbineStore.aliases
     },
     DB_VERSION
   )
@@ -328,6 +330,18 @@ watch(bladePanels, (panels) => {
             <el-descriptions-item label="投运日期">{{ report.turbine.commissionDate }}</el-descriptions-item>
             <el-descriptions-item label="登记叶片数">{{ report.turbine.bladeCount }} 片</el-descriptions-item>
             <el-descriptions-item label="结构版本">v{{ report.dbVersion }}</el-descriptions-item>
+            <el-descriptions-item v-if="report.turbine.previousCodes.length > 0" label="曾用编号" :span="2">
+              <el-tag
+                v-for="code in report.turbine.previousCodes"
+                :key="code"
+                size="small"
+                type="info"
+                effect="plain"
+                class="alias-tag"
+              >
+                {{ code }}
+              </el-tag>
+            </el-descriptions-item>
           </el-descriptions>
 
           <div class="dist-grid">
@@ -378,6 +392,13 @@ watch(bladePanels, (panels) => {
               <template #title>
                 <div class="panel-title">
                   <strong>叶片 {{ panel.blade.serial }}</strong>
+                  <el-tooltip
+                    v-if="panel.previousSerials.length > 0"
+                    content="该叶片的曾用序号（改号历史）"
+                    placement="top"
+                  >
+                    <span class="muted">曾用 {{ panel.previousSerials.join('、') }}</span>
+                  </el-tooltip>
                   <span class="muted">
                     {{ panel.blade.lengthM }} m · {{ panel.blade.material }} · {{ panel.segments.length }} 段
                   </span>
@@ -416,26 +437,46 @@ watch(bladePanels, (panels) => {
                 <el-table-column type="expand" width="60">
                   <template #default="{ row }">
                     <el-table :data="row.defects" size="small" border class="defect-subtable">
-                      <el-table-column label="类型" prop="type" width="110" />
+                      <el-table-column label="类型" width="110">
+                        <template #default="{ row: defectRow }">{{ defectRow.defect.type }}</template>
+                      </el-table-column>
                       <el-table-column label="程度" width="150">
-                        <template #default="{ row: defect }">
-                          <SeverityTag :severity="defect.severity" size="small" />
+                        <template #default="{ row: defectRow }">
+                          <SeverityTag :severity="defectRow.defect.severity" size="small" />
                         </template>
                       </el-table-column>
                       <el-table-column label="尺寸" width="180">
-                        <template #default="{ row: defect }">
-                          <span class="mono">{{ formatSize(defect.lengthMm, defect.widthMm) }}</span>
+                        <template #default="{ row: defectRow }">
+                          <span class="mono">{{ formatSize(defectRow.defect.lengthMm, defectRow.defect.widthMm) }}</span>
                         </template>
                       </el-table-column>
-                      <el-table-column label="面位" prop="face" width="90" />
-                      <el-table-column label="展向位置" width="110">
-                        <template #default="{ row: defect }">{{ defect.positionM }} m</template>
+                      <el-table-column label="面位" width="90">
+                        <template #default="{ row: defectRow }">{{ defectRow.defect.face }}</template>
                       </el-table-column>
-                      <el-table-column label="发现日期" prop="foundAt" width="120" />
+                      <el-table-column label="展向位置" width="110">
+                        <template #default="{ row: defectRow }">{{ defectRow.defect.positionM }} m</template>
+                      </el-table-column>
+                      <el-table-column label="发现日期" width="120">
+                        <template #default="{ row: defectRow }">{{ defectRow.defect.foundAt }}</template>
+                      </el-table-column>
+                      <el-table-column label="当时编号" min-width="150">
+                        <template #default="{ row: defectRow }">
+                          <span class="mono">{{ defectRow.turbineCode }} · 叶片 {{ defectRow.bladeSerial }}</span>
+                          <el-tag
+                            v-if="defectRow.turbineCode !== report.turbine.code || defectRow.bladeSerial !== panel.blade.serial"
+                            size="small"
+                            type="warning"
+                            effect="plain"
+                            class="alias-tag"
+                          >
+                            改号前
+                          </el-tag>
+                        </template>
+                      </el-table-column>
                       <el-table-column label="状态" width="100">
-                        <template #default="{ row: defect }">
-                          <span :style="{ color: stateColor(defect.state), fontWeight: 600 }">
-                            {{ defect.state }}
+                        <template #default="{ row: defectRow }">
+                          <span :style="{ color: stateColor(defectRow.defect.state), fontWeight: 600 }">
+                            {{ defectRow.defect.state }}
                           </span>
                         </template>
                       </el-table-column>
@@ -464,9 +505,18 @@ watch(bladePanels, (panels) => {
                 <span class="mono">#{{ row.order.id.slice(-6) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="定位" min-width="180">
+            <el-table-column label="定位（当时编号）" min-width="200">
               <template #default="{ row }">
-                叶片 {{ row.bladeSerial }}｜第 {{ row.segmentIndex }} 段
+                {{ row.turbineCodeAt }} · 叶片 {{ row.bladeSerialAt }}｜第 {{ row.segmentIndex }} 段
+                <el-tag
+                  v-if="row.turbineCodeAt !== report.turbine.code"
+                  size="small"
+                  type="warning"
+                  effect="plain"
+                  class="alias-tag"
+                >
+                  改号前
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="缺陷" min-width="150">
@@ -524,6 +574,9 @@ watch(bladePanels, (panels) => {
           <el-descriptions-item label="分段">{{ importCounts.segments }}</el-descriptions-item>
           <el-descriptions-item label="缺陷">{{ importCounts.defects }}</el-descriptions-item>
           <el-descriptions-item label="工单">{{ importCounts.workOrders }}</el-descriptions-item>
+          <el-descriptions-item label="变更单 / 别名">
+            {{ importCounts.changeOrders ?? 0 }} / {{ importCounts.codeAliases ?? 0 }}
+          </el-descriptions-item>
           <el-descriptions-item label="文件版本">v{{ importPayload.dbVersion }}</el-descriptions-item>
         </el-descriptions>
         <el-radio-group v-model="importMode" class="import-mode">
@@ -599,6 +652,10 @@ watch(bladePanels, (panels) => {
   align-items: center;
   gap: 10px;
   font-size: 13px;
+}
+
+.alias-tag {
+  margin-left: 6px;
 }
 
 .defect-subtable {

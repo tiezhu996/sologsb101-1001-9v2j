@@ -6,11 +6,23 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { initialAliasId, orderAliasId } from '@/types/changeOrder'
 import { reportFileName, type TurbineReport } from '@/utils/report'
 
-const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
+const COLLECTIONS = [
+  'turbines',
+  'blades',
+  'segments',
+  'defects',
+  'workOrders',
+  'changeOrders',
+  'codeAliases'
+] as const
 
 type CollectionKey = (typeof COLLECTIONS)[number]
+
+/** 旧版本备份文件可能缺少的集合：导入时按空数组兜底 */
+const OPTIONAL_COLLECTIONS: CollectionKey[] = ['changeOrders', 'codeAliases']
 
 /** 校验备份对象的必备字段，返回错误信息数组（为空表示通过） */
 export function validateBackup(input: unknown): {
@@ -25,6 +37,7 @@ export function validateBackup(input: unknown): {
   const obj = input as Partial<BackupPayload>
   if (obj.app !== 'gbwindblade') errors.push('app 字段应为 gbwindblade，文件来源不明')
   for (const key of COLLECTIONS) {
+    if (OPTIONAL_COLLECTIONS.includes(key)) continue
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -37,19 +50,23 @@ export function validateBackup(input: unknown): {
     blades: obj.blades ?? [],
     segments: obj.segments ?? [],
     defects: obj.defects ?? [],
-    workOrders: obj.workOrders ?? []
+    workOrders: obj.workOrders ?? [],
+    changeOrders: obj.changeOrders ?? [],
+    codeAliases: obj.codeAliases ?? []
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的全量备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [turbines, blades, segments, defects, workOrders] = await Promise.all([
+  const [turbines, blades, segments, defects, workOrders, changeOrders, codeAliases] = await Promise.all([
     db.turbines.toArray(),
     db.blades.toArray(),
     db.segments.toArray(),
     db.defects.toArray(),
-    db.workOrders.toArray()
+    db.workOrders.toArray(),
+    db.changeOrders.toArray(),
+    db.codeAliases.toArray()
   ])
   return {
     app: 'gbwindblade',
@@ -59,7 +76,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     blades,
     segments,
     defects,
-    workOrders
+    workOrders,
+    changeOrders,
+    codeAliases
   }
 }
 
@@ -82,7 +101,9 @@ export function countPayload(payload: BackupPayload): Record<CollectionKey, numb
     blades: payload.blades.length,
     segments: payload.segments.length,
     defects: payload.defects.length,
-    workOrders: payload.workOrders.length
+    workOrders: payload.workOrders.length,
+    changeOrders: payload.changeOrders.length,
+    codeAliases: payload.codeAliases.length
   }
 }
 
@@ -123,13 +144,19 @@ export async function importBackup(
   overwrite: boolean
 ): Promise<Record<CollectionKey, number>> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await db.turbines.bulkPut(payload.turbines)
-    await db.blades.bulkPut(payload.blades)
-    await db.segments.bulkPut(payload.segments)
-    await db.defects.bulkPut(payload.defects)
-    await db.workOrders.bulkPut(payload.workOrders)
-  })
+  await db.transaction(
+    'rw',
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.changeOrders, db.codeAliases],
+    async () => {
+      await db.turbines.bulkPut(payload.turbines)
+      await db.blades.bulkPut(payload.blades)
+      await db.segments.bulkPut(payload.segments)
+      await db.defects.bulkPut(payload.defects)
+      await db.workOrders.bulkPut(payload.workOrders)
+      await db.changeOrders.bulkPut(payload.changeOrders)
+      await db.codeAliases.bulkPut(payload.codeAliases)
+    }
+  )
   return countPayload(payload)
 }
 
@@ -139,6 +166,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const bladeIdMap = new Map<string, string>()
   const segmentIdMap = new Map<string, string>()
   const defectIdMap = new Map<string, string>()
+  const workOrderIdMap = new Map<string, string>()
+  const orderIdMap = new Map<string, string>()
 
   const turbines = payload.turbines.map((turbine) => {
     const id = createId('tbn')
@@ -160,11 +189,65 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     defectIdMap.set(defect.id, id)
     return { ...defect, id, segmentId: segmentIdMap.get(defect.segmentId) ?? defect.segmentId }
   })
-  const workOrders = payload.workOrders.map((order) => ({
-    ...order,
-    id: createId('wo'),
-    defectId: defectIdMap.get(order.defectId) ?? order.defectId
-  }))
+  const workOrders = payload.workOrders.map((order) => {
+    const id = createId('wo')
+    workOrderIdMap.set(order.id, id)
+    return { ...order, id, defectId: defectIdMap.get(order.defectId) ?? order.defectId }
+  })
 
-  return { ...payload, turbines, blades, segments, defects, workOrders }
+  /** 按实体类型重映射目标 id（不在本次导入范围内时保留原引用） */
+  const remapTarget = (entityType: 'turbine' | 'blade', targetId: string): string =>
+    entityType === 'turbine'
+      ? turbineIdMap.get(targetId) ?? targetId
+      : bladeIdMap.get(targetId) ?? targetId
+  const remapParent = (parentId: string | null): string | null =>
+    parentId === null ? null : turbineIdMap.get(parentId) ?? parentId
+
+  const changeOrders = payload.changeOrders.map((order) => {
+    const id = createId('aco')
+    orderIdMap.set(order.id, id)
+    return {
+      ...order,
+      id,
+      mappings: order.mappings.map((mapping) => {
+        const targetId = remapTarget(mapping.entityType, mapping.targetId)
+        return {
+          ...mapping,
+          targetId,
+          parentId: remapParent(mapping.parentId),
+          key: `${mapping.entityType}:${targetId}`
+        }
+      }),
+      progress: {
+        ...order.progress,
+        appliedKeys: order.progress.appliedKeys.map((key) => {
+          const [entityType, targetId] = key.split(':')
+          if (entityType !== 'turbine' && entityType !== 'blade') return key
+          const mapped = remapTarget(entityType, targetId)
+          return mapped === targetId ? key : `${entityType}:${mapped}`
+        })
+      },
+      snapshot: order.snapshot
+        ? {
+            ...order.snapshot,
+            turbineIds: order.snapshot.turbineIds.map((tid) => turbineIdMap.get(tid) ?? tid),
+            bladeIds: order.snapshot.bladeIds.map((bid) => bladeIdMap.get(bid) ?? bid),
+            segmentIds: order.snapshot.segmentIds.map((sid) => segmentIdMap.get(sid) ?? sid),
+            defectIds: order.snapshot.defectIds.map((did) => defectIdMap.get(did) ?? did),
+            workOrderIds: order.snapshot.workOrderIds.map((wid) => workOrderIdMap.get(wid) ?? wid)
+          }
+        : null
+    }
+  })
+
+  const codeAliases = payload.codeAliases.map((alias) => {
+    const targetId = remapTarget(alias.entityType, alias.targetId)
+    const parentId = remapParent(alias.parentId)
+    const orderId = alias.orderId ? orderIdMap.get(alias.orderId) ?? alias.orderId : ''
+    // 保留确定性 id 规则：初始登记 / 变更单别名重算，重复导入互相覆盖
+    const id = orderId ? orderAliasId(orderId, targetId) : initialAliasId(targetId)
+    return { ...alias, id, targetId, parentId, orderId }
+  })
+
+  return { ...payload, turbines, blades, segments, defects, workOrders, changeOrders, codeAliases }
 }

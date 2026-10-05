@@ -2,6 +2,8 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { registerInitialAlias, removeAliasesFor } from '@/utils/changeOrder'
+import { previousCodesOf, resolveByCode, type CodeAlias } from '@/types/changeOrder'
 import {
   DEFAULT_BLADE_COUNT,
   commissionYearOf,
@@ -50,6 +52,9 @@ export const useTurbineStore = defineStore('turbine', () => {
   const workOrdersTable = useIdbTable<WorkOrder>((database) => database.workOrders, {
     sortByUpdatedAt: false
   })
+  const aliasesTable = useIdbTable<CodeAlias>((database) => database.codeAliases, {
+    sortByUpdatedAt: false
+  })
 
   const prefs = readUiPrefs()
   const currentTurbineId = ref<string | null>(prefs.lastTurbineId)
@@ -66,6 +71,7 @@ export const useTurbineStore = defineStore('turbine', () => {
   const segments = computed<Segment[]>(() => segmentsTable.rows.value)
   const defects = computed<Defect[]>(() => defectsTable.rows.value)
   const workOrders = computed<WorkOrder[]>(() => workOrdersTable.rows.value)
+  const aliases = computed<CodeAlias[]>(() => aliasesTable.rows.value)
   const loading = computed(() => turbinesTable.loading.value)
   /** 机组表是否已完成首次载入：区分「机组不存在」与「尚未读取」 */
   const turbinesReady = computed(() => turbinesTable.ready.value)
@@ -133,12 +139,13 @@ export const useTurbineStore = defineStore('turbine', () => {
     return map
   })
 
-  /** 机组合账的筛选结果（关键字 + 机型 + 投运年份） */
+  /** 机组合账的筛选结果（关键字 + 机型 + 投运年份）；关键字同时匹配曾用编号，旧铭牌也能搜到 */
   const filteredTurbines = computed<Turbine[]>(() =>
     turbines.value.filter((turbine) => {
       const kw = keyword.value.trim()
       if (kw.length > 0) {
-        const haystack = `${turbine.code}${turbine.model}${turbine.commissionDate}${turbine.hubHeightM}`
+        const history = previousCodesOf(aliases.value, 'turbine', turbine.id).join('')
+        const haystack = `${turbine.code}${turbine.model}${turbine.commissionDate}${turbine.hubHeightM}${history}`
         if (!haystack.includes(kw)) return false
       }
       if (modelFilter.value.length > 0 && !modelFilter.value.includes(turbine.model)) return false
@@ -179,7 +186,23 @@ export const useTurbineStore = defineStore('turbine', () => {
     return blades.value.find((blade) => blade.id === id)
   }
 
-  /** 新建机组：按 bladeCount 派生对应数量的叶片记录 */
+  /** 机组曾用编号（已失效别名，按失效时间倒序） */
+  function previousCodesOfTurbine(turbineId: string): string[] {
+    return previousCodesOf(aliases.value, 'turbine', turbineId)
+  }
+
+  /** 叶片曾用序号 */
+  function previousSerialsOfBlade(bladeId: string): string[] {
+    return previousCodesOf(aliases.value, 'blade', bladeId)
+  }
+
+  /** 按任意时期编号反查机组（兼容读取：旧铭牌编号也能定位当前机组） */
+  function findTurbineByAnyCode(code: string): Turbine | undefined {
+    const id = resolveByCode(aliases.value, 'turbine', code)
+    return id ? turbines.value.find((turbine) => turbine.id === id) : undefined
+  }
+
+  /** 新建机组：按 bladeCount 派生对应数量的叶片记录，并登记初始编号别名 */
   async function createTurbine(input: CreateTurbineInput): Promise<Turbine> {
     const turbine = await turbinesTable.create(
       {
@@ -207,6 +230,10 @@ export const useTurbineStore = defineStore('turbine', () => {
       })
     }
     await bladesTable.bulkPut(newBlades)
+    await registerInitialAlias('turbine', turbine.id, null, turbine.code, turbine.createdAt)
+    for (const blade of newBlades) {
+      await registerInitialAlias('blade', blade.id, turbine.id, blade.serial, now)
+    }
     currentTurbineId.value = turbine.id
     return turbine
   }
@@ -242,6 +269,9 @@ export const useTurbineStore = defineStore('turbine', () => {
         })
       }
       await bladesTable.bulkPut(added)
+      for (const blade of added) {
+        await registerInitialAlias('blade', blade.id, turbineId, blade.serial, now)
+      }
       await turbinesTable.update(turbineId, { bladeCount: target })
       return added.length
     }
@@ -270,6 +300,7 @@ export const useTurbineStore = defineStore('turbine', () => {
       },
       'bld'
     )
+    await registerInitialAlias('blade', blade.id, input.turbineId, blade.serial, blade.createdAt)
     const list = bladesOfTurbine(input.turbineId)
     await turbinesTable.update(input.turbineId, { bladeCount: list.length })
     return blade
@@ -279,7 +310,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     await bladesTable.update(id, patch)
   }
 
-  /** 级联删除叶片：分段 → 缺陷 → 工单 */
+  /** 级联删除叶片：分段 → 缺陷 → 工单 → 编号别名 */
   async function removeBlade(id: string): Promise<void> {
     const blade = bladeById(id)
     const segmentIds = segments.value.filter((segment) => segment.bladeId === id).map((segment) => segment.id)
@@ -288,12 +319,13 @@ export const useTurbineStore = defineStore('turbine', () => {
       .map((defect) => defect.id)
     await db.transaction(
       'rw',
-      [db.blades, db.segments, db.defects, db.workOrders],
+      [db.blades, db.segments, db.defects, db.workOrders, db.codeAliases],
       async () => {
         await db.workOrders.where('defectId').anyOf(defectIds).delete()
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.delete(id)
+        await removeAliasesFor([id])
       }
     )
     if (blade) {
@@ -302,7 +334,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     }
   }
 
-  /** 级联删除机组：叶片 → 分段 → 缺陷 → 工单 */
+  /** 级联删除机组：叶片 → 分段 → 缺陷 → 工单 → 编号别名 */
   async function removeTurbine(id: string): Promise<void> {
     const bladeIds = bladesOfTurbine(id).map((blade) => blade.id)
     const segmentIds = segments.value
@@ -313,13 +345,14 @@ export const useTurbineStore = defineStore('turbine', () => {
       .map((defect) => defect.id)
     await db.transaction(
       'rw',
-      [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
+      [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.codeAliases],
       async () => {
         await db.workOrders.where('defectId').anyOf(defectIds).delete()
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.bulkDelete(bladeIds)
         await db.turbines.delete(id)
+        await removeAliasesFor([id, ...bladeIds])
       }
     )
     if (currentTurbineId.value === id) currentTurbineId.value = null
@@ -331,6 +364,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     segments,
     defects,
     workOrders,
+    aliases,
     loading,
     turbinesReady,
     currentTurbineId,
@@ -353,6 +387,9 @@ export const useTurbineStore = defineStore('turbine', () => {
     segmentsOfTurbine,
     defectsOfTurbine,
     workOrdersOfTurbine,
+    previousCodesOfTurbine,
+    previousSerialsOfBlade,
+    findTurbineByAnyCode,
     createTurbine,
     updateTurbine,
     syncBladeCount,

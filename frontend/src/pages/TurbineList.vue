@@ -89,6 +89,7 @@ const cards = computed(() =>
     return {
       turbine,
       blades: turbineStore.bladesOfTurbine(turbine.id),
+      previousCodes: turbineStore.previousCodesOfTurbine(turbine.id),
       bladeCount: stat?.bladeCount ?? 0,
       segmentCount: stat?.segmentCount ?? 0,
       defectCount: stat?.defectCount ?? 0,
@@ -268,7 +269,7 @@ const summary = computed(() => turbineStore.totals)
     <FilterBar
       :model-value="filterModel"
       :selects="filterSelects"
-      keyword-placeholder="搜索机组编号 / 机型 / 投运日期…"
+      keyword-placeholder="搜索机组编号（含曾用编号）/ 机型 / 投运日期…"
       class="section-card"
       @change="handleFilterChange"
     />
@@ -290,6 +291,13 @@ const summary = computed(() => turbineStore.totals)
             <div class="turbine-card__title">
               <strong>{{ card.turbine.code }}</strong>
               <el-tag size="small" effect="plain" type="info">{{ card.turbine.model }}</el-tag>
+              <el-tooltip
+                v-if="card.previousCodes.length > 0"
+                content="改号前的旧编号已保留为别名，搜索旧编号仍可定位本机组"
+                placement="top"
+              >
+                <span class="turbine-card__alias">曾用 {{ card.previousCodes.join('、') }}</span>
+              </el-tooltip>
             </div>
             <el-tag v-if="card.openCount > 0" size="small" type="warning" effect="dark">
               未闭环 {{ card.openCount }}
@@ -437,6 +445,14 @@ const summary = computed(() => turbineStore.totals)
   align-items: center;
   gap: 8px;
   font-size: 16px;
+}
+
+.turbine-card__alias {
+  font-size: 12px;
+  color: #8c8479;
+  background: #f5f1e8;
+  border-radius: 4px;
+  padding: 1px 6px;
 }
 
 .turbine-card__progress {

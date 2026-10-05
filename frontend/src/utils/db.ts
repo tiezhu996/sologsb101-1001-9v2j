@@ -4,12 +4,13 @@ import type { Blade, BladeMaterial, BladeSerial } from '@/types/blade'
 import type { Segment, SegmentFace } from '@/types/segment'
 import type { Defect, DefectState, DefectType, Severity } from '@/types/defect'
 import type { WorkOrder, WorkOrderState } from '@/types/workOrder'
+import { initialAliasId, type ChangeOrder, type CodeAlias } from '@/types/changeOrder'
 
 /** 本地 IndexedDB 库名 */
 export const DB_NAME = 'gbwindblade'
 
 /** 本地结构版本号：新增 / 修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧的少量元数据键 */
 export const LS_KEYS = {
@@ -38,6 +39,8 @@ export interface BackupPayload {
   segments: Segment[]
   defects: Defect[]
   workOrders: WorkOrder[]
+  changeOrders: ChangeOrder[]
+  codeAliases: CodeAlias[]
 }
 
 /** 全部业务表集合，清空与导入共用 */
@@ -46,7 +49,9 @@ export const ALL_TABLES = [
   'blades',
   'segments',
   'defects',
-  'workOrders'
+  'workOrders',
+  'changeOrders',
+  'codeAliases'
 ] as const
 
 export class WindBladeDatabase extends Dexie {
@@ -55,6 +60,8 @@ export class WindBladeDatabase extends Dexie {
   segments!: Table<Segment, string>
   defects!: Table<Defect, string>
   workOrders!: Table<WorkOrder, string>
+  changeOrders!: Table<ChangeOrder, string>
+  codeAliases!: Table<CodeAlias, string>
 
   constructor() {
     super(DB_NAME)
@@ -66,7 +73,7 @@ export class WindBladeDatabase extends Dexie {
       workOrders: 'id, defectId, team, state, updatedAt'
     })
     // v2：分段补充检修面索引，缺陷补充面位 / 状态 / 发现日期索引，工单补充限期索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         turbines: 'id, code, model, commissionDate, updatedAt',
         blades: 'id, turbineId, serial, material, updatedAt',
@@ -101,6 +108,56 @@ export class WindBladeDatabase extends Dexie {
             if (!segment.face) segment.face = 'PS'
           })
       })
+    // v3：新增资产变更单与编号别名表；存量机组 / 叶片回填初始登记别名
+    this.version(DB_VERSION)
+      .stores({
+        turbines: 'id, code, model, commissionDate, updatedAt',
+        blades: 'id, turbineId, serial, material, updatedAt',
+        segments: 'id, bladeId, index, face, updatedAt',
+        defects: 'id, segmentId, type, severity, face, state, foundAt, updatedAt',
+        workOrders: 'id, defectId, team, state, dueDate, updatedAt',
+        changeOrders: 'id, code, state, updatedAt',
+        codeAliases: 'id, entityType, targetId, code, parentId, orderId, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const aliases: CodeAlias[] = []
+        await tx
+          .table<Turbine>('turbines')
+          .toCollection()
+          .each((turbine) => {
+            aliases.push({
+              id: initialAliasId(turbine.id),
+              entityType: 'turbine',
+              targetId: turbine.id,
+              parentId: null,
+              code: turbine.code,
+              validFrom: typeof turbine.createdAt === 'number' ? turbine.createdAt : 0,
+              validTo: null,
+              orderId: '',
+              createdAt: now,
+              updatedAt: now
+            })
+          })
+        await tx
+          .table<Blade>('blades')
+          .toCollection()
+          .each((blade) => {
+            aliases.push({
+              id: initialAliasId(blade.id),
+              entityType: 'blade',
+              targetId: blade.id,
+              parentId: blade.turbineId,
+              code: blade.serial,
+              validFrom: typeof blade.createdAt === 'number' ? blade.createdAt : 0,
+              validTo: null,
+              orderId: '',
+              createdAt: now,
+              updatedAt: now
+            })
+          })
+        await tx.table('codeAliases').bulkPut(aliases)
+      })
   }
 }
 
@@ -114,15 +171,21 @@ export function createId(prefix: string): string {
 
 /** 清空全部业务表，供「清空本地数据」与导入前覆盖使用 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await Promise.all([
-      db.turbines.clear(),
-      db.blades.clear(),
-      db.segments.clear(),
-      db.defects.clear(),
-      db.workOrders.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.changeOrders, db.codeAliases],
+    async () => {
+      await Promise.all([
+        db.turbines.clear(),
+        db.blades.clear(),
+        db.segments.clear(),
+        db.defects.clear(),
+        db.workOrders.clear(),
+        db.changeOrders.clear(),
+        db.codeAliases.clear()
+      ])
+    }
+  )
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -258,6 +321,7 @@ export async function seedDemoData(): Promise<boolean> {
   const segments: Segment[] = []
   const defects: Defect[] = []
   const workOrders: WorkOrder[] = []
+  const codeAliases: CodeAlias[] = []
 
   const blueprints: Array<{
     code: string
@@ -306,6 +370,18 @@ export async function seedDemoData(): Promise<boolean> {
       createdAt: now,
       updatedAt: now
     })
+    codeAliases.push({
+      id: initialAliasId(turbineId),
+      entityType: 'turbine',
+      targetId: turbineId,
+      parentId: null,
+      code: blueprint.code,
+      validFrom: now,
+      validTo: null,
+      orderId: '',
+      createdAt: now,
+      updatedAt: now
+    })
 
     blueprint.serials.forEach((serial, bladeIndex) => {
       const bladeId = createId('bld')
@@ -317,6 +393,18 @@ export async function seedDemoData(): Promise<boolean> {
         lengthM: blueprint.lengthM,
         material: blueprint.material,
         segmentCount,
+        createdAt: now,
+        updatedAt: now
+      })
+      codeAliases.push({
+        id: initialAliasId(bladeId),
+        entityType: 'blade',
+        targetId: bladeId,
+        parentId: turbineId,
+        code: serial,
+        validFrom: now,
+        validTo: null,
+        orderId: '',
         createdAt: now,
         updatedAt: now
       })
@@ -396,13 +484,14 @@ export async function seedDemoData(): Promise<boolean> {
 
   await db.transaction(
     'rw',
-    [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.codeAliases],
     async () => {
       await db.turbines.bulkPut(turbines)
       await db.blades.bulkPut(blades)
       await db.segments.bulkPut(segments)
       await db.defects.bulkPut(defects)
       await db.workOrders.bulkPut(workOrders)
+      await db.codeAliases.bulkPut(codeAliases)
     }
   )
 
